@@ -13,19 +13,27 @@ require_once dirname(__FILE__) . '/../lib/XS.php';
 require_once dirname(__FILE__) . '/XSUtil.class.php';
 
 // check arguments
-XSUtil::parseOpt(array('p', 'q', 'c', 'd', 'project', 'query', 'db', 'limit', 'charset'));
+XSUtil::parseOpt(array('p', 'q', 'c', 'd', 's', 'project', 'query', 'db', 'limit', 'charset', 'sort', 'add-weight', 'scws-multi', 'cut-off'));
 $project = XSUtil::getOpt('p', 'project', true);
 $query = XSUtil::getOpt('q', 'query', true);
 $hot = XSUtil::getOpt(null, 'hot');
 $synonyms = XSUtil::getOpt(null, 'list-synonyms');
+$terms = XSUtil::getOpt(null, 'terms');
+$weights = XSUtil::getOpt(null, 'add-weight');
+$info = XSUtil::getOpt(null, 'info');
+$scws_multi = XSUtil::getOpt(null, 'scws-multi');
+$cut_off = XSUtil::getOpt(null, 'cut-off');
 
 // magick output charset
 $charset = XSUtil::getOpt('c', 'charset');
 XSUtil::setCharset($charset);
 $query = XSUtil::convertIn($query);
 
+// sort scheme
+$sort = XSUtil::getOpt('s', 'sort');
+
 if (XSUtil::getOpt('h', 'help') !== null || !is_string($project)
-	|| (!$hot && !$synonyms && !is_string($query)))
+	|| (!$info && !$hot && !$synonyms && !is_string($query)))
 {
 	$version = PACKAGE_NAME . '/' . PACKAGE_VERSION;
 	echo <<<EOF
@@ -38,15 +46,22 @@ Quest - 搜索查询和测试工具 ($version)
     --project=<name|ini>
     -p <project> 用于指定要搜索的项目名称或项目配置文件的路径，
                  如果指定的是名称，则使用 ../app/<name>.ini 作为配置文件
-    --query=<query>	
-    -q <query>   指定要搜索的查询语句，如果语句中包含空格请用使用双引号包围起来
-    --fuzzy      将搜索默认设为模糊搜索
-    --synonym    开启自动同义词搜索功能
     --charset=<gbk|utf-8>
     -c <charset> 指定您当前在用的字符集，以便系统进行智能转换（默认：UTF-8）
     --db=<name[,name2 ...]>
     -d <db[,db2 ...]> 指定项目中的数据库名称，默认是名为 db 的库，多个库之间用逗号分隔
-    --hot[=total|last|cur] 
+    --query=<query>
+    -q <query>   指定要搜索的查询语句，如果语句中包含空格请用使用双引号包围起来
+                 在搜索语句中可采用 'field:\$from..\$to' 做区间过滤
+    --sort=<field1[,field2[,...]]
+    -s <field1[,field2[,...]] 指定排序字段，在字段前加上 ~ 符号表示逆序
+    --fuzzy      将搜索默认设为模糊搜索
+    --synonym    开启自动同义词搜索功能
+    --scws-multi=<level>
+                 查看或设置搜索语句的 scws 复合分词等级（值：0-15，默认为 3）
+    --add-weight=<[field1:]word1[:weight1][,[field2:]word2[:weight2]]>
+                 添加搜索权重词汇，词与次数之间用半角冒号分隔
+    --hot[=total|last|cur]
                  用于显示指定项目的热门搜索词，此时 <query> 参数无意义，可省略
                  其值含义分别表示总搜索量、上周搜索量、本周搜索量，默认为总搜索量。
     --suggest    根据当前搜索词展开常用搜索词建议，如查询“中”，即显示“中”开头的词
@@ -58,6 +73,10 @@ Quest - 搜索查询和测试工具 ($version)
     --limit=<num>用于设置 suggest|hot|related 的返回数量，两者默认值均为 10 个
                  对于普通搜索和列出同义词时，还支持用 --limit=offset,num 的格式
     --show-query 用于在搜索结果显示内部的 Xapian 结构的 query 语句用于调试
+    --cut-off=<percent[,weight>
+                 设置搜索结果剔除的匹配百分比及权限（百分比：0-100，权重：0.1-25.5）
+    --terms      列出搜索词被切分后的词（不含排除及权重词）
+    --info       显示当前连接服务端的信息及线程（仅绘制当前 worker 进程）
     -h|--help    显示帮助信息
 
     若未指定 -p 或 -q 则会依次把附加的参数当作 <project> 和 <query> 处理，例：
@@ -101,6 +120,8 @@ try
 			$search->addDb(trim($dbs[$i]));
 		}
 	}
+	if ($scws_multi !== null)
+		$search->setScwsMulti($scws_multi);
 
 	if ($hot !== null)
 	{
@@ -118,6 +139,17 @@ try
 				$i++;
 			}
 		}
+	}
+	else if ($info !== null)
+	{
+		// server info
+		echo "---------- SERVER INFO BEGIN ----------\n";
+		$res = $search->execCommand(CMD_DEBUG);
+		echo $res->buf;
+		echo "\n---------- SERVER INFO END ----------\n";
+		// thread pool
+		$res = $search->execCommand(CMD_SEARCH_DRAW_TPOOL);
+		echo $res->buf;
 	}
 	else if ($synonyms !== null)
 	{
@@ -148,6 +180,12 @@ try
 				printf("%4d. %s %s\n", $i++, XSUtil::fixWidth($raw, 29), implode(", ", $list));
 			}
 		}
+	}
+	else if ($terms !== null)
+	{
+		$result = $search->terms($query);
+		echo "列出\033[7m" . $query . "\033[m的内部切分结果：\n";
+		print_r($result);
 	}
 	else if ($correct !== null)
 	{
@@ -209,6 +247,24 @@ try
 			$offset = intval($limit);
 		}
 
+		// sort
+		if ($sort !== null)
+		{
+			$fields = array();
+			$tmps = explode(',', $sort);
+			foreach ($tmps as $tmp)
+			{
+				$tmp = trim($tmp);
+				if ($tmp === '')
+					continue;
+				if (substr($tmp, 0, 1) === '~')
+					$fields[substr($tmp, 1)] = false;
+				else
+					$fields[$tmp] = true;
+			}
+			$search->setMultiSort($fields);
+		}
+
 		// special fields
 		$fid = $xs->getFieldId();
 		$ftitle = $xs->getFieldTitle();
@@ -216,9 +272,64 @@ try
 		if ($fbody)
 			$xs->getFieldBody()->cutlen = 100;
 
+		// add range
+		$ranges = array();
+		if (strpos($query, '..') !== false)
+		{
+			$regex = '/(\S+?):(\S*?)\.\.(\S*)/';
+			if (preg_match_all($regex, $query, $matches) > 0)
+			{
+				for ($i = 0; $i < count($matches[0]); $i++)
+				{
+					$ranges[] = array($matches[1][$i]
+						, $matches[2][$i] === '' ? null : $matches[2][$i]
+						, $matches[3][$i] === '' ? null : $matches[3][$i]);
+					$query = str_replace($matches[0][$i], '', $query);
+				}
+			}
+		}
+
+		// set query
+		$search->setQuery($query);
+		foreach ($ranges as $range)
+		{
+			$search->addRange($range[0], $range[1], $range[2]);
+		}
+
+		// add weights
+		if ($weights !== null)
+		{
+			foreach (explode(',', $weights) as $tmp)
+			{
+				$tmp = explode(':', trim($tmp));
+				if (count($tmp) === 1)
+					$search->addWeight(null, $tmp[0]);
+				else if (count($tmp) === 2)
+				{
+					if (is_numeric($tmp[1]))
+						$search->addWeight(null, $tmp[0], floatval($tmp[1]));
+					else
+						$search->addWeight($tmp[0], $tmp[1]);
+				}
+				else
+					$search->addWeight($tmp[0], $tmp[1], floatval($tmp[2]));
+			}
+		}
+
+		// cut off
+		if ($cut_off !== null)
+		{
+			if (($pos = strpos($cut_off, ',')))
+				$search->setCutOff(substr($cut_off, 0, $pos), substr($cut_off, $pos + 1));
+			else if (strpos($cut_off, '.') !== false)
+				$search->setCutOff(0, $cut_off);
+			else
+				$search->setCutOff($cut_off);
+		}
+
 		// preform search
 		$begin = microtime(true);
-		$result = $search->setQuery($query)->setLimit($limit1, $offset)->search();
+		$result = $search->setLimit($limit1, $offset)->search();
 		$cost = microtime(true) - $begin;
 		$matched = $search->getLastCount();
 		$total = $search->getDbTotal();
@@ -251,7 +362,7 @@ try
 				$body = cli_highlight($doc->f($fbody)) . "\n";
 
 			// main fields
-			printf("\n%d. \033[4m%s#%s# [%d%%]\033[m\n", $doc->rank(), $title, $doc->f($fid), $doc->percent());
+			printf("\n%d. \033[4m%s#%s# [%d%%,%.2f]\033[m\n", $doc->rank(), $title, $doc->f($fid), $doc->percent(), $doc->weight());
 			echo $body;
 
 			// other fields

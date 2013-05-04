@@ -26,6 +26,8 @@ XSUtil::setCharset($charset);
 $params = array('source', 'file', 'sql', 'rebuild', 'clean', 'flush', 'flush-log', 'info', 'csv-delimiter', 'filter');
 $params[] = 'add-synonym';
 $params[] = 'del-synonym';
+$params[] = 'stop-rebuild';
+$params[] = 'custom-dict';
 foreach ($params as $_)
 {
 	$k = strtr($_, '-', '_');
@@ -35,10 +37,12 @@ foreach ($params as $_)
 // file & database
 $file = XSUtil::getOpt(null, 'file', true);
 $db = XSUtil::getOpt('d', 'db');
+$scws_multi = XSUtil::getOpt(null, 'scws-multi');
 
 // help message
 if (XSUtil::getOpt('h', 'help') !== null || !is_string($project)
-	|| (!$flush && !$flush_log && !$info && !$clean && !$source && !$add_synonym && !$del_synonym))
+	|| (!$custom_dict && !$stop_rebuild && !$flush && !$flush_log
+	&& !$info && !$clean && !$source && !$add_synonym && !$del_synonym && !$scws_multi))
 {
 	$version = PACKAGE_NAME . '/' . PACKAGE_VERSION;
 	echo <<<EOF
@@ -76,11 +80,15 @@ Indexer - 索引批量管理、导入工具 ($version)
     --del-synonym=<raw1[:synonym1[,raw2[:synonym2]]]...>
                  删除一个或多个同义词, 多个之间用半角逗号分隔, 原词和同义词之间用冒号分隔
                  省略同义词则表示删除该原词的所有同义词
+    --scws-multi[=level]
+                 查看或设置搜索语句的 scws 复合分词等级（值：0-15，默认为 3）
     --rebuild    使用平滑重建方式导入数据，必须与 --source 配合使用
+    --stop-rebuild 强制中止没未完成的索引重建状态 (慎用)
     --clean      清空库内当前的索引数据
+    --custom-dict 读取/设置项目自定义词库，默认为读取，配合 --file 指定文件去设置词库
     --flush      强制提交刷新索引服务端的缓冲索引，与 --source 分开用
     --flush-log	 强制提交刷新搜索日志，与 --source 分开用
-    --info       查看当前索引库在服务端的信息（含数据缓冲、运行进程等）
+    --info       查看当前索引库在服务端的信息（含服务端信息、数据缓冲、运行进程等）
     -h|--help    显示帮助信息
 
 EOF;
@@ -156,9 +164,21 @@ try
 	if ($db !== null)
 		$index->setDb($db);
 
+	// scws multi
+	if ($scws_multi !== null && $scws_multi !== true)
+	{
+		$index->setScwsMulti($scws_multi);
+		if (!empty($source))
+			$scws_multi = null;
+	}
+
 	// special actions
 	if ($info !== null)
 	{
+		echo "---------- SERVER INFO BEGIN ----------\n";
+		$res = $index->execCommand(CMD_DEBUG);
+		echo $res->buf;
+		echo "\n---------- SERVER INFO END ----------\n";
 		$res = $index->execCommand(CMD_INDEX_GET_DB);
 		$res = json_decode($res->buf);
 		echo "数据库名：" . $res->name . "\n";
@@ -181,6 +201,39 @@ try
 		else
 			echo "成功，注意：后台更新需要一些时间，并不是真正立即完成。\n";
 	}
+	else if ($custom_dict !== null)
+	{
+		if ($file === null)
+		{
+			$content = $index->getCustomDict();
+			if ($content === '')
+				echo "注意：该项目无自定义词库或内容为空！";
+			else
+			{
+				if (substr($content, 0, 1) !== '#')
+					echo "# WORD\tTF\tIDF\tATTR\n";
+				echo $content;
+			}
+			echo "\n";
+		}
+		else
+		{
+			if ($file === true || !file_exists($file))
+				echo "错误：请正确指定要替换的自定义词库文件路径 (" . strval($file) . ")\n";
+			else
+			{
+				$content = file_get_contents($file);
+				echo "正在提交自定义词库 (" . number_format(strlen($content)) . " bytes) ... ";
+				$index->setCustomDict($content);
+				echo "OK\n";
+			}
+		}
+	}
+	else if ($scws_multi !== null)
+	{
+		$level = $index->getScwsMulti();
+		echo "当前索引库的 scws 复合分词等级为：$level\n";
+	}
 	else
 	{
 		// clean
@@ -188,6 +241,13 @@ try
 		{
 			echo "清空现有索引数据 ...\n";
 			$index->clean();
+		}
+
+		// stop rebuild
+		if ($stop_rebuild !== null)
+		{
+			echo "中止索引重建 ...\n";
+			$index->stopRebuild();
 		}
 
 		// begin rebuild
@@ -207,7 +267,6 @@ try
 			$dcs = $src->getCharset();
 			if ($dcs === false)
 				$dcs = $charset === null ? 'UTF-8' : $charset;
-			$doc = new XSDocument($dcs);
 
 			echo "开始批量导入数据 (" . (empty($file) ? "请直接输入数据" : $file) . ") ...\n";
 			XSUtil::flush();
@@ -215,6 +274,7 @@ try
 			$index->openBuffer();
 			while ($data = $src->getData())
 			{
+				$doc = new XSDocument($dcs);
 				if ($source == 'csv')
 				{
 					$data = csv_transform($data);
@@ -233,6 +293,8 @@ try
 				$doc->setFields($data);
 				try
 				{
+					if ($filter !== null && method_exists($filter, 'processDoc'))
+						$filter->processDoc($doc);
 					$total++;
 					$index->update($doc);
 					$total_ok++;
@@ -243,7 +305,6 @@ try
 					echo $e->getTraceAsString();
 					$total_failed++;
 				}
-				$doc->setFields(null);
 				if (($total % 10000) == 0)
 					echo "报告：累计已处理数据 $total 条 ...\n";
 			}

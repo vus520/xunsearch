@@ -47,6 +47,7 @@ class XSIndexTest extends PHPUnit_Framework_TestCase
 	protected function tearDown()
 	{
 		$this->object->clean();
+		$this->object->xs = null;
 		$this->object = null;
 	}
 
@@ -71,7 +72,7 @@ class XSIndexTest extends PHPUnit_Framework_TestCase
 			
 		}
 		$this->assertInstanceOf('XSException', $e);
-		$this->assertEquals('Missing value of primarky key (FIELD:pid)', $e->getMessage());
+		$this->assertEquals('Missing value of primary key (FIELD:pid)', $e->getMessage());
 
 		// Adding use default charset		
 		$doc = new XSDocument(self::$data_gbk);
@@ -81,7 +82,7 @@ class XSIndexTest extends PHPUnit_Framework_TestCase
 		$doc = new XSDocument(self::$data, 'utf-8');
 		$this->object->add($doc);
 		$this->object->flushIndex();
-		sleep(2);
+		sleep(3);
 
 		// test result
 		$search->setCharset('utf-8');
@@ -139,6 +140,38 @@ class XSIndexTest extends PHPUnit_Framework_TestCase
 		$this->assertEquals(1, $search->reopen(true)->dbTotal);
 	}
 
+	public function testRebuild2()
+	{
+		$search = $this->object->xs->search;
+		$doc = new XSDocument(self::$data_gbk);
+		$this->object->add($doc);
+		$this->object->add($doc);
+		$this->object->flushIndex();
+		sleep(3);
+		$this->assertEquals(2, $search->reopen(true)->dbTotal);
+
+		$this->object->beginRebuild();
+		$this->object->add($doc);
+		$this->object->add($doc);
+		$this->assertEquals(2, $search->reopen(true)->dbTotal);
+		$this->object->beginRebuild();
+		$this->object->add($doc);
+		$this->assertEquals(2, $search->reopen(true)->dbTotal);
+		$this->object->endRebuild();
+		$this->object->flushIndex();
+		sleep(2);
+		$this->assertEquals(1, $search->reopen(true)->dbTotal);
+
+		$this->object->beginRebuild();
+		$this->object->add($doc);
+		$this->object->add($doc);
+		$this->object->endRebuild();
+		$this->object->stopRebuild();
+		$this->object->flushIndex();
+		sleep(2);
+		$this->assertEquals(1, $search->reopen(true)->dbTotal);
+	}
+
 	public function testSynonyms($buffer = false)
 	{
 		$index = $this->object;
@@ -155,7 +188,7 @@ class XSIndexTest extends PHPUnit_Framework_TestCase
 		if ($buffer)
 			$index->closeBuffer();
 		$index->flushIndex();
-		sleep(2);
+		sleep(4);
 
 		$synonyms = $search->reopen(true)->getAllSynonyms(0, 0, true);
 		$this->assertArrayNotHasKey('FOO', $synonyms);
@@ -191,5 +224,87 @@ class XSIndexTest extends PHPUnit_Framework_TestCase
 	public function testSynonyms2()
 	{
 		$this->testSynonyms(true);
+	}
+
+	public function testCustomDict()
+	{
+		$index = $this->object;
+		$index->setCustomDict('');
+		$this->assertEmpty($index->getCustomDict());
+		$dict = <<<EOF
+搜一下	1.0		1.1		vn
+测测看	2.0		2.1		vn
+EOF;
+		$index->setCustomDict($dict);
+		$this->assertEquals($dict, $index->getCustomDict());
+
+		// add document
+		$doc = new XSDocument(self::$data, 'utf-8');
+		$doc->subject = '去测测看';
+		$this->object->add($doc);
+		$this->object->flushIndex();
+		sleep(3);
+		$search = $this->object->xs->search;
+		$search->reopen(true);
+		$search->setCharset('utf-8');
+		$this->assertEquals(1, $search->count('subject:测测看'));
+		$this->assertEquals(1, $search->count('subject:测看'));
+		$this->assertEquals(0, $search->count('subject:看'));
+	}
+
+	private function countSubjectTerm($term)
+	{
+		$search = $this->object->xs->search->reopen(true)->setCharset('utf-8');
+		return $search->setQuery(null)->addQueryTerm('subject', $term)->count();
+	}
+
+	public function testScwsMulti()
+	{
+		// objects
+		$index = $this->object;
+		$doc = new XSDocument('utf-8');
+		$doc->pid = 7788;
+		$doc->subject = '管理制度';
+		$doc->message = '中华人民共和国';
+		// default scws
+		$this->assertEquals(3, $index->getScwsMulti());
+		$index->setScwsMulti(16);
+		$this->assertEquals(3, $index->getScwsMulti());
+		$index->setScwsMulti(-1);
+		$this->assertEquals(3, $index->getScwsMulti());
+		$index->update($doc);
+		$index->flushIndex();
+		sleep(2);
+		$this->assertEquals(1, $this->countSubjectTerm('管理制度'));
+		$this->assertEquals(1, $this->countSubjectTerm('管理'));
+		$this->assertEquals(0, $this->countSubjectTerm('管'));
+		$this->assertEquals(0, $this->countSubjectTerm('制'));
+		// multi = 0
+		$index->setScwsMulti(0);
+		$index->update($doc);
+		$index->flushIndex();
+		sleep(2);
+		$this->assertEquals(1, $this->countSubjectTerm('管理制度'));
+		$this->assertEquals(0, $this->countSubjectTerm('管理'));
+		$this->assertEquals(0, $this->countSubjectTerm('管'));
+		$this->assertEquals(0, $this->countSubjectTerm('制'));
+		// multi = 5
+		$index->setScwsMulti(5);
+		$index->update($doc);
+		$index->flushIndex();
+		sleep(2);
+		$this->assertEquals(1, $this->countSubjectTerm('管理制度'));
+		$this->assertEquals(1, $this->countSubjectTerm('管理'));
+		$this->assertEquals(1, $this->countSubjectTerm('管'));
+		$this->assertEquals(0, $this->countSubjectTerm('制'));
+		// multi = 15
+		$index->setScwsMulti(15);
+		$index->update($doc);
+		$index->flushIndex();
+		sleep(2);
+		$this->assertEquals(1, $this->countSubjectTerm('管理制度'));
+		$this->assertEquals(1, $this->countSubjectTerm('管理'));
+		$this->assertEquals(1, $this->countSubjectTerm('管'));
+		$this->assertEquals(1, $this->countSubjectTerm('制'));
 	}
 }

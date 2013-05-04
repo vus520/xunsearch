@@ -19,9 +19,13 @@ extern "C" {
 #define	XS_DBF_TOCLEAN			0x01	// marked to clean
 #define	XS_DBF_FORCE_COMMIT		0x02	// forced to commit(first|after clean)
 #define	XS_DBF_STUB				0x04	// stub database
+
 #define	XS_DBF_REBUILD_BEGIN	0x08	// index rebuild begin
 #define	XS_DBF_REBUILD_END		0x10	// index rebuild end
 #define	XS_DBF_REBUILD_WAIT		0x20	// index rebuild begin during import running
+#define	XS_DBF_REBUILD_STOP		0x40	// index rebuild forced to stop
+#define	XS_DBF_REBUILD_MASK		0x78
+
 #define	XS_MAX_NAME_LEN			32		// max name len
 
 /**
@@ -32,7 +36,8 @@ typedef struct xs_db
 {
 	char name[XS_MAX_NAME_LEN];
 	// name of database -> $HOME/$name (we can use stub file to support remote db)
-	int flag; // db flag, 0x01->to be cleand
+	short flag; // db flag, 0x01->to be cleand
+	short scws_multi; //scws multi setting
 	int fd; // temp fd to save received data
 	int count; // count of uncommitted documents
 	int lcount; // last count of record point

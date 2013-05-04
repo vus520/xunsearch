@@ -39,6 +39,16 @@
 #define	IS_RQST_CMD(c)		(c==CMD_INDEX_SUBMIT||c==CMD_DOC_TERM||c==CMD_DOC_INDEX||c==CMD_DOC_VALUE)
 #define	IS_INDEX_CMD(c)		(c==CMD_INDEX_REQUEST||c==CMD_INDEX_REMOVE||c==CMD_INDEX_EXDATA||c==CMD_INDEX_SYNONYMS)
 
+// ensure that the parent process run first
+// redirect logging message
+#define	EXTERNAL_CALL(p, ...)	do { \
+	usleep(50000); \
+	log_dup2(STDOUT_FILENO); \
+	log_dup2(STDERR_FILENO); \
+	exit(execl(p, ##__VA_ARGS__, NULL)); \
+} while(0)
+
+
 /**
  * Global variables
  */
@@ -74,12 +84,13 @@ static void show_usage()
 	printf("  -F               Run the server on foreground (non-daemon)\n");
 	printf("  -H <home>        Specify the working directory\n");
 	printf("                   Default: " PREFIX "\n");
+	printf("  -L <log_level>   Larger the value to get more information, (1-7, default: %d)\n", LOG_NOTICE);
 	printf("  -b <port>|<address:port>|<path>\n");
-	printf("                   Binding adddress/port or path for the server, (default: " DEFAULT_BIND_PATH ")\n");
+	printf("                   Bind the server to adddress/port or path, (default: " DEFAULT_BIND_PATH ")\n");
 	printf("  -l <log_file>    Specify the log output file, (default: none)\n");
 	printf("                   E.g: " DEFAULT_TEMP_DIR "%s.log, stderr\n", prog_name);
-	printf("  -q <num>         Set the queue size to trigger commit, (default: %d)\n", DEFAULT_QUEUE_SIZE);
-	printf("  -e <bin_path>    Set the external executable program path, (default: " DEFAULT_BIN_PATH ")\n");
+	printf("  -q <num>         Set the queue size to commit, (default: %d)\n", DEFAULT_QUEUE_SIZE);
+	printf("  -e <bin_path>    Set the external program path, (default: " DEFAULT_BIN_PATH ")\n");
 	printf("  -k [fast]<stop|start|restart|reload> Server process running control\n");
 	printf("  -v               Show version information\n");
 	printf("  -h               Display this help page\n\n");
@@ -96,33 +107,41 @@ static void xs_logging_call(XS_USER *user)
 	time_t now = time(NULL);
 
 	if (user == NULL)
-		log_debug("check to call xs-logging (IMPORT_NUM:%d, TIME_CC:%d)", import_num, now - time_logging);
-	if (user != NULL || ((now - time_logging) > 7200))
+	{
+		log_debug("check to call xs-logging (IMPORT_NUM:%d, TIME_CC:%d)",
+			import_num, now - time_logging);
+	}
+
+	if (user != NULL || ((now - time_logging) >= LOGGING_CALL_PERIOD))
 	{
 		pid_t pid = fork();
+
 		if (pid == 0)
 		{
-			// redirect logging message
-			log_dup2(STDOUT_FILENO);
-			log_dup2(STDERR_FILENO);
-
-			// call external program
+			char *option, *home;
 			if (user == NULL)
-				exit(execl(xs_logging, "xs-logging", "-SQT", DEFAULT_DATA_DIR, NULL));
+			{
+				option = "-SQT";
+				home = DEFAULT_DATA_DIR;
+			}
 			else
-				exit(execl(xs_logging, "xs-logging", "-QT", user->home, NULL));
+			{
+				option = "-QT";
+				home = user->home;
+			}
+			EXTERNAL_CALL(xs_logging, "xs-logging", option, home);
 		}
 		else if (pid > 0)
 		{
-			// increase the import process number
-			import_num++;
+			import_num++; // increase the import process number
 			if (user == NULL)
 				time_logging = now;
+			log_notice("spawn a logging process (IMPORT_NUM:%d, PID:%d, USER:%s)",
+				import_num, pid, user == NULL ? "NULL" : user->name);
 		}
 		else
 		{
-			// fork error(), the file will try to import in next calling
-			log_printf("failed to fork child logging process (ERROR:%s)", strerror(errno));
+			log_error("failed to fork logging process (ERROR:%s)", strerror(errno));
 		}
 	}
 }
@@ -137,22 +156,19 @@ static void db_import_call(XS_DB *db, XS_USER *user)
 	char dbpath[256], sndfile[128];
 
 	// temporary swap file
-	sprintf(dbpath, "%s/%s", user->home, db->name);
+	sprintf(dbpath, "%s/%s%s", user->home, db->name, (db->flag & XS_DBF_REBUILD_BEGIN) ? ".re" : "");
 	sprintf(sndfile, DEFAULT_TEMP_DIR "%s_%s.snd", user->name, db->name);
-	if (db->flag & XS_DBF_REBUILD_BEGIN)
-		strcat(dbpath, ".re");
 
 	// check old send file first
 	if (access(sndfile, R_OK) == 0)
-		log_printf("priority to commit unfinished sndfile (FILE:%s)", sndfile);
+		log_notice("priority use unfinished sndfile (FILE:%s)", sndfile);
 	else
 	{
 		char rcvfile[128], *suffix;
 		int i = 0;
 
 		// check to commit older file first
-		sprintf(rcvfile, DEFAULT_TEMP_DIR "%s_%s.rcv", user->name, db->name);
-		suffix = rcvfile + strlen(rcvfile);
+		suffix = rcvfile + sprintf(rcvfile, DEFAULT_TEMP_DIR "%s_%s.rcv", user->name, db->name);
 #if SIZEOF_OFF_T < 8
 		for (i = MAX_SPLIT_FILES; i > 0; i--)
 		{
@@ -160,11 +176,11 @@ static void db_import_call(XS_DB *db, XS_USER *user)
 			if (!access(rcvfile, R_OK))
 			{
 				if (rename(rcvfile, sndfile) == 0)
-					log_printf("priority to commit older splitted file (OLD:%s)", rcvfile);
+					log_notice("priority use old splitted file (OLD:%s)", rcvfile);
 				else
 				{
 					i = 0;
-					log_printf("failed to rename older file, commit new file (OLD:%s, ERROR:%s)",
+					log_error("failed to rename old splitted file (OLD:%s, ERROR:%s)",
 						rcvfile, strerror(errno));
 				}
 				break;
@@ -178,55 +194,45 @@ static void db_import_call(XS_DB *db, XS_USER *user)
 			// re-check parameters [maye come from user command]
 			if (db->count == 0 || db->fd < 0)
 			{
-				log_printf("not necessary commit request (DB:%s.%s)", user->name, db->name);
+				log_notice("unnecessary commit request (DB:%s.%s)", user->name, db->name);
 				return;
 			}
 
-			// release some resource
+			// free resource
 			close(db->fd);
 			db->fd = -1;
 			db->count = db->lcount = 0;
+			db->flag &= ~XS_DBF_FORCE_COMMIT; // clean force flag
 
 			// rename the file
 			*suffix = '\0';
 			if (rename(rcvfile, sndfile) != 0)
 			{
-				log_printf("failed to rename rcvfile (FILE:%s, ERROR:%s)",
+				log_error("failed to rename rcvfile (FILE:%s, ERROR:%s)",
 					rcvfile, strerror(errno));
 				return;
 			}
-
-			// clean force flag
-			db->flag &= ~XS_DBF_FORCE_COMMIT;
 		}
 	}
 
 	// fork child process to run the import
 	if ((pid = fork()) == 0)
 	{
-		// ensure that the parent process run first
-		usleep(50000);
-		// redirect logging message
-		log_dup2(STDOUT_FILENO);
-		log_dup2(STDERR_FILENO);
-
-		// TODO: cleanup some global resources?!
-
-		// call external program
-		exit(execl(xs_import, "xs-import", "-Q", dbpath, sndfile, NULL));
+		char arg[16];
+		sprintf(arg, "-m%d", db->scws_multi);
+		EXTERNAL_CALL(xs_import, "xs-import", "-Q", arg, dbpath, sndfile);
 	}
 	else if (pid > 0)
 	{
 		// save pid in parent
-		log_debug("success to fork child import process (PID:%d, DB:%p)", pid, db);
+		log_info("spawn a import progress (PID:%d, DB:%p)", pid, db);
+		import_num++; // increase the import process number
 		db->pid = pid;
-		// increase the import process number
-		import_num++;
 	}
 	else
 	{
 		// fork error(), the file will try to import in next calling
-		log_printf("failed to fork child import process (DB:%s.%s, ERROR:%s)",
+		log_error("failed to fork import process (DB:%s.%s, ERROR:%s)",
 			user->name, db->name, strerror(errno));
 	}
 }
@@ -239,11 +245,11 @@ static void db_commit_check()
 {
 	XS_USER *user;
 	XS_DB *db;
-	time_t now;
+	time_t now = time(NULL);
 
-	time(&now);
-	user = (XS_USER *) G_VAR(user_base);
 	log_debug("check to commit database (EXIT:%s)", (main_flag & FLAG_ON_EXIT) ? "yes" : "no");
+
+	user = (XS_USER *) G_VAR(user_base);
 	while (user != NULL)
 	{
 		for (db = user->db; db != NULL; db = db->next)
@@ -264,10 +270,11 @@ static void db_commit_check()
 			if (db->count == 0 || db->fd < 0 || db->pid != 0)
 				continue;
 
-			// allow to submit small request
-			if (import_num >= MAX_IMPORT_NUM && db->count > MIN_COMMIT_COUNT)
+			// allow to submit small/forced request
+			if (import_num >= MAX_IMPORT_NUM && db->count > MIN_COMMIT_COUNT
+				&& !(db->flag & XS_DBF_FORCE_COMMIT))
 			{
-				log_printf("server is too busy to skip commit (IMPORT_NUM:%d, DB:%s.%s, COUNT:%d)",
+				log_notice("server is too busy to skip commit (IMPORT_NUM:%d, DB:%s.%s, COUNT:%d)",
 					import_num, user->name, db->name, db->count);
 				continue;
 			}
@@ -276,14 +283,13 @@ static void db_commit_check()
 			if (!(db->flag & XS_DBF_FORCE_COMMIT)
 				&& db->count < MIN_COMMIT_COUNT && (now - db->ltime) < MIN_COMMIT_TIME)
 			{
-				log_printf("skip to commit temporary (DB:%s.%s, COUNT:%d)",
+				log_notice("skip too frequently commit (DB:%s.%s, COUNT:%d)",
 					user->name, db->name, db->count);
 				continue;
 			}
 
 			// do commit
-			log_printf("commit index data automatically (DB:%s.%s, COUNT:%d)",
-				user->name, db->name, db->count);
+			log_notice("commit index data (DB:%s.%s, COUNT:%d)", user->name, db->name, db->count);
 			db_import_call(db, user);
 		}
 		user = user->next;
@@ -342,10 +348,7 @@ static int rmdir_r(const char *fpath)
 	DIR *dirp;
 
 	if (!(dirp = opendir(fpath)))
-	{
-		log_printf("can not open directory (DIR:%s)", fpath);
 		return 0;
-	}
 
 	for (fname = buf; (*fname = *fpath) != '\0'; fname++, fpath++);
 	if (fname[-1] != '/') *fname++ = '/';
@@ -419,11 +422,13 @@ static int safe_write(int fd, void *buf, int size)
 static inline void main_cleanup()
 {
 	// add exit flag for other signal handler (child)
+	if (main_flag & FLAG_ON_EXIT)
+		return;
 	main_flag |= FLAG_ON_EXIT;
 
 	if (main_flag & FLAG_G_INITED)
 	{
-		log_printf("server terminated, force to check commit for all db");
+		log_notice("terminated, check to commit all db");
 		db_commit_check();
 
 		xs_user_deinit();
@@ -438,7 +443,7 @@ static inline void main_cleanup()
  */
 int signal_term(int sig)
 {
-	log_printf("caught system %ssignal[%d], terminate immediately",
+	log_alert("caught %ssignal[%d], terminate immediately",
 		(sig == SIGTERM ? "" : "exceptional "), sig);
 	main_cleanup();
 	return main_flag & FLAG_NO_ERROR ? 0 : -1;
@@ -457,22 +462,24 @@ static void rebuild_wdb_end(XS_DB *db, XS_USER *user)
 	// rename the db.re => db
 	sprintf(dbre, "%s/%s.re", user->home, db->name);
 	sprintf(dbpath, "%s/%s", user->home, db->name);
-	log_debug("rebuild finished, rename (PATH:%s -> %s)", dbre, dbpath);
+	log_info("rebuild finished, rename db (PATH:%s -> %s)", dbre, dbpath);
 	if (rmdir_r(dbpath) != 0 || rename(dbre, dbpath) != 0)
 	{
-		log_printf("failed to rename rebuilt database (DB:%s.%s, ERROR:%s)",
+		log_error("failed to rename rebuilt database (DB:%s.%s, ERROR:%s)",
 			user->name, db->name, strerror(errno));
 	}
+
 	// clean db_a
 	if (!strcmp(db->name, DEFAULT_DB_NAME))
 	{
 		strcat(dbpath, "_a");
-		log_debug("clean old archive database (PATH:%s)", dbpath);
+		log_info("clean old archive database (PATH:%s)", dbpath);
 		rmdir_r(dbpath);
 	}
 
 	// clean flag
-	db->flag &= ~(XS_DBF_REBUILD_BEGIN | XS_DBF_REBUILD_END | XS_DBF_REBUILD_WAIT);
+	db->flag &= ~XS_DBF_REBUILD_MASK;
+	db->flag |= XS_DBF_FORCE_COMMIT;
 }
 
 /**
@@ -484,10 +491,9 @@ void signal_child(pid_t pid, int status)
 	XS_USER *user = NULL;
 	XS_DB *db;
 
-	// TODO: check on_exit flag?!
 	if (main_flag & FLAG_ON_EXIT)
 	{
-		log_printf("skip exit report from child process (PID:%d, EXIT:%d)", pid, status);
+		log_notice("skip exit report from child process (PID:%d, EXIT:%d)", pid, status);
 		return;
 	}
 
@@ -495,7 +501,7 @@ void signal_child(pid_t pid, int status)
 	import_num--;
 	if ((db = db_get_by_pid(pid, &user)) == NULL)
 	{
-		log_printf("can not get db by pid (PID:%d)", pid);
+		log_error("failed to find db by pid (PID:%d)", pid);
 		return;
 	}
 
@@ -504,8 +510,8 @@ void signal_child(pid_t pid, int status)
 	time(&db->ltime);
 
 	// logging
-	log_printf("child import process exit (DB:%s.%s%s, PID:%d, EXIT:%d)",
-		user->name, db->name, (db->flag & XS_DBF_REBUILD_BEGIN ? ".re" : ""), pid, status);
+	log_notice("import exit (DB:%s.%s%s, FLAG:0x%04x, PID:%d, EXIT:%d)",
+		user->name, db->name, (db->flag & XS_DBF_REBUILD_BEGIN ? ".re" : ""), db->flag, pid, status);
 	sprintf(sndfile, DEFAULT_TEMP_DIR "%s_%s.snd", user->name, db->name);
 
 	// check result
@@ -517,31 +523,54 @@ void signal_child(pid_t pid, int status)
 
 		unlink(sndfile);
 		sprintf(sndfile, "%s/%s", user->home, db->name);
-		log_debug("clean marked database (PATH:%s)", sndfile);
+		log_notice("clean marked database (PATH:%s)", sndfile);
 		if (rmdir_r(sndfile) != 0)
 		{
-			log_printf("failed to clean marked database (DB:%s.%s, ERROR:%s)",
+			log_error("failed to clean marked database (DB:%s.%s, ERROR:%s)",
 				user->name, db->name, strerror(errno));
 		}
 		if (!strcmp(db->name, DEFAULT_DB_NAME))
 		{
 			strcat(sndfile, "_a");
-			log_debug("clean marked archive database (PATH:%s)", sndfile);
-			rmdir_r(sndfile);
+			if (!access(sndfile, R_OK))
+			{
+				log_notice("clean marked archive (PATH:%s)", sndfile);
+				rmdir_r(sndfile);
+			}
 		}
+	}
+	else if (db->flag & XS_DBF_REBUILD_STOP)
+	{
+		db->flag &= ~XS_DBF_REBUILD_MASK;
+		db->flag |= XS_DBF_FORCE_COMMIT;
+		unlink(sndfile);
+		log_notice("rebuild stopped (DB:%s.%s)", user->name, db->name);
 	}
 	else if (db->flag & XS_DBF_REBUILD_WAIT)
 	{
+		char repath[256];
+
+		// clean exists rebuild db
+		sprintf(repath, "%s/%s.re", user->home, db->name);
+		if (!access(repath, R_OK))
+		{
+			log_notice("clean exists rebuilt database (PATH:%s)", repath);
+			rmdir_r(repath);
+		}
+
 		// marked as rebuild
 		db->flag ^= XS_DBF_REBUILD_WAIT;
 		unlink(sndfile);
-		log_debug("rebuild marked database (DB:%s.%s)", user->name, db->name);
+		log_notice("rebuild marked database (DB:%s.%s)", user->name, db->name);
 	}
 	else if (status == 0)
 	{
 		// quit normal, remove sndfile
 		if (unlink(sndfile) != 0)
-			log_printf("failed to remove sndfile (PATH:%s, ERROR:%s)", sndfile, strerror(errno));
+		{
+			log_error("failed to remove sndfile (PATH:%s, ERROR:%s)", sndfile, strerror(errno));
+		}
+
 		// check to rebuild end!
 		if (db->flag & XS_DBF_REBUILD_END)
 			rebuild_wdb_end(db, user);
@@ -557,7 +586,7 @@ void signal_child(pid_t pid, int status)
  */
 void signal_int()
 {
-	log_printf("caught SIGINT, shutdown gracefully");
+	log_alert("caught SIGINT, shutdown gracefully");
 	conn_server_push_back(NULL);
 }
 
@@ -568,10 +597,12 @@ void signal_reload(int sig)
 {
 	if (sig == SIGTSTP)
 	{
-		log_printf("accepted request number (NUM:%d)", conn_server_get_num_accept());
-		return;
+		log_printf("accepted requests (NUM:%d)", conn_server_get_num_accept());
 	}
-	log_printf("caught reload signal[%d], but nothing to do", sig);
+	else
+	{
+		log_notice("caught reload signal[%d], but nothing to do", sig);
+	}
 }
 
 /**
@@ -612,7 +643,7 @@ static inline void update_eff_size(int fd)
  */
 static inline void check_eff_size(int fd)
 {
-	off_t file_size, eff_size;
+	off_t file_size, eff_size = 0;
 
 	file_size = lseek(fd, 0, SEEK_END);
 	lseek(fd, sizeof(XS_CMD) + offsetof(struct xs_import_hdr, eff_size), SEEK_SET);
@@ -620,7 +651,12 @@ static inline void check_eff_size(int fd)
 	if (read(fd, &eff_size, sizeof(off_t)) != sizeof(off_t)
 		|| eff_size > file_size || eff_size <= (sizeof(XS_CMD) + sizeof(struct xs_import_hdr)))
 	{
-		// invalid file, reset import header		
+		// invalid file, reset import header
+		if (file_size > 0)
+		{
+			log_notice("reset import file header (FILE_SIZE:%ld, EFF_SIZE:%ld)",
+				file_size, eff_size);
+		}
 		lseek(fd, 0, SEEK_SET);
 		update_eff_size(fd);
 	}
@@ -630,11 +666,42 @@ static inline void check_eff_size(int fd)
 		// in fact, we need not truncate file to zero size
 		if (eff_size < file_size)
 		{
-			log_printf("reset filesize (FILE_SIZE:%ld, EFF_SIZE:%ld)", file_size, eff_size);
+			log_notice("reset import file size (FILE_SIZE:%ld, EFF_SIZE:%ld)",
+				file_size, eff_size);
 			ftruncate(fd, eff_size);
 		}
 		lseek(fd, eff_size, SEEK_SET);
 	}
+}
+
+/**
+ * Clean uncommited index data
+ * @param db
+ * @param user
+ */
+static inline void clean_uncommitted_data(XS_DB *db, XS_USER *user)
+{
+	// clean splitted file
+#if SIZEOF_OFF_T < 8
+	int i = 0;
+	char fpath[256], *suffix;
+
+	sprintf(fpath, DEFAULT_TEMP_DIR "%s_%s.rcv", user->name, db->name);
+	suffix = fpath + strlen(fpath);
+	for (i = MAX_SPLIT_FILES; i > 0; i--)
+	{
+		sprintf(suffix, ".%d", i);
+		if (!access(fpath, R_OK))
+		{
+			unlink(fpath);
+		}
+	}
+#endif	/* LARGEFILE */
+
+	// clean current file
+	lseek(db->fd, 0, SEEK_SET);
+	update_eff_size(db->fd);
+	db->count = db->lcount = 0;
 }
 
 /**
@@ -646,29 +713,38 @@ static int rebuild_conn_wdb(XS_CONN *conn)
 {
 	XS_DB *db = get_conn_wdb(conn);
 
-	log_debug_conn("rebuild current wdb (DB:%p)", db);
+	log_info_conn("try to rebuild current wdb (DB:%s.%s)", conn->user->name, db->name);
 	if (db == NULL)
 		return CONN_RES_ERR(NODB);
 	else if (db->flag & XS_DBF_STUB)
 		return CMD_RES_UNIMP;
-	else if (db->flag & XS_DBF_REBUILD_BEGIN)
+		/* allow rebuild during rebuilding, just clean exists data */
+	else if (db->flag & XS_DBF_REBUILD_STOP)
 		return CONN_RES_ERR(REBUILDING);
 	else
 	{
-		// NOTE: may need to clean db_name.re, .rcv[.X] first?
-		// clean un-committed data (.rcv)
 		if (db->fd >= 0)
 		{
-			log_debug_conn("clean uncommitted index data for rebuilding");
-			lseek(db->fd, 0, SEEK_SET);
-			update_eff_size(db->fd);
-			db->count = db->lcount = 0;
+			// clean un-committed data (.rcv)
+			log_debug_conn("clean uncommitted data for rebuilding");
+			clean_uncommitted_data(db, conn->user);
 		}
 		if (db->pid > 0 && !(db->flag & XS_DBF_TOCLEAN) && !kill(db->pid, SIGTERM))
 		{
-			// BUG: if import exit normal HERE may cause some problem	
+			// BUG: if import exit normal HERE may cause some problem
 			db->flag |= XS_DBF_REBUILD_WAIT;
-			log_debug_conn("notify running import to quit & set rebuild_wait flag");
+			log_notice_conn("notify running import to quit & set rebuild_wait flag");
+		}
+		else
+		{
+			// clean exists rebuild db
+			char repath[256];
+			sprintf(repath, "%s/%s.re", conn->user->home, db->name);
+			if (!access(repath, R_OK))
+			{
+				log_notice("clean exists rebuilt database (PATH:%s)", repath);
+				rmdir_r(repath);
+			}
 		}
 		db->flag |= XS_DBF_REBUILD_BEGIN;
 		return CONN_RES_OK(DB_REBUILD);
@@ -684,7 +760,7 @@ static int remove_conn_wdb(XS_CONN *conn)
 {
 	XS_DB *db = get_conn_wdb(conn);
 
-	log_debug_conn("clean current wdb (DB:%p)", db);
+	log_info_conn("try to clean current wdb (DB:%s.%s)", conn->user->name, db->name);
 	if (db == NULL)
 		return CONN_RES_ERR(NODB);
 	else if (db->flag & XS_DBF_STUB)
@@ -701,25 +777,26 @@ static int remove_conn_wdb(XS_CONN *conn)
 		sprintf(dbpath, "%s/%s", conn->user->home, db->name);
 		if (stat(dbpath, &st))
 		{
-			log_conn("failed to stat path of database (PATH:%s, ERROR:%s)", dbpath, strerror(errno));
+			if (errno != ENOENT)
+			{
+				log_notice_conn("failed to stat database (PATH:%s, ERROR:%s)", dbpath, strerror(errno));
+			}
 			return errno == ENOENT ? CONN_RES_OK(DB_CLEAN) : CONN_RES_ERR(STAT);
 		}
 		if (!S_ISDIR(st.st_mode))
 		{
-			// stub database unsupported
-			log_debug_conn("dbpath is not a regular directory, unsupported");
+			// stub database
+			log_notice_conn("dbpath is not a directory, not supported (PATH:%s)", dbpath);
 			db->flag |= XS_DBF_STUB;
 			return CMD_RES_UNIMP;
 		}
 
-		// clean un-committed data (.rcv)
 		db->flag |= XS_DBF_FORCE_COMMIT; // force commit after cleaning
 		if (db->fd >= 0)
 		{
+			// clean un-committed data (.rcv)
 			log_debug_conn("clean uncommitted index data");
-			lseek(db->fd, 0, SEEK_SET);
-			update_eff_size(db->fd);
-			db->count = db->lcount = 0;
+			clean_uncommitted_data(db, conn->user);
 		}
 
 		if (db->pid > 0 && !kill(db->pid, SIGTERM))
@@ -727,26 +804,29 @@ static int remove_conn_wdb(XS_CONN *conn)
 			// BUG: if import exit normal HERE, wdb has not DBF_TOCLEAN, may cause some problem
 			// import program running (notify it to quit, set clean flag), clean ASYNC
 			db->flag |= XS_DBF_TOCLEAN;
-			log_debug_conn("notify running import to quit & set clean flag");
 
+			log_notice_conn("notify running import to quit & set clean flag");
 			return CONN_RES_OK(DB_CLEAN);
 		}
 		else
 		{
 			// remove the database from disk
-			log_debug_conn("removing database directory (PATH:%s)", dbpath);
+			log_debug_conn("remove the whole database (PATH:%s)", dbpath);
 			if (rmdir_r(dbpath) == 0)
 			{
 				if (!strcmp(db->name, DEFAULT_DB_NAME))
 				{
 					strcat(dbpath, "_a");
-					log_debug_conn("removing database archive (PATH:%s)", dbpath);
-					rmdir_r(dbpath);
+					if (!access(dbpath, R_OK))
+					{
+						log_notice_conn("remove the archive database (PATH:%s)", dbpath);
+						rmdir_r(dbpath);
+					}
 				}
 				return CONN_RES_OK(DB_CLEAN);
 			}
 
-			log_conn("failed to remove database (PATH:%s, ERROR:%s)", dbpath, strerror(errno));
+			log_error_conn("failed to remove database (PATH:%s, ERROR:%s)", dbpath, strerror(errno));
 			return CONN_RES_ERR(REMOVE_DB);
 		}
 	}
@@ -759,7 +839,7 @@ static int remove_conn_wdb(XS_CONN *conn)
  */
 static int save_conn_request(XS_CONN *conn)
 {
-	int rc = CMD_RES_CONT;
+	int last_count, rc = CMD_RES_CONT;
 	off_t off;
 	XS_CMD *cmd = conn->zcmd;
 	XS_DB *db;
@@ -779,15 +859,16 @@ static int save_conn_request(XS_CONN *conn)
 		sprintf(rcvfile, DEFAULT_TEMP_DIR "%s_%s.rcv", conn->user->name, db->name);
 		if ((db->fd = open(rcvfile, O_RDWR | O_CREAT, 0600)) < 0)
 		{
-			log_conn("failed to open rcvfile (PATH:%s, ERROR:%s)", rcvfile, strerror(errno));
+			log_error_conn("failed to open rcvfile (PATH:%s, ERROR:%s)", rcvfile, strerror(errno));
 			rc = CONN_RES_ERR(OPEN_FILE);
 			goto save_end;
 		}
-		log_debug_conn("check file header for rcvfile (FILE:%s)", rcvfile);
+		log_debug_conn("check rcvfile header (FILE:%s)", rcvfile);
 		check_eff_size(db->fd);
 	}
 
-	// parse & sav ethe commands
+	// parse & save the commands
+	last_count = db->count;
 	off = lseek(db->fd, 0, SEEK_CUR);
 	if (cmd->cmd == CMD_INDEX_EXDATA)
 	{
@@ -852,14 +933,17 @@ static int save_conn_request(XS_CONN *conn)
 	}
 	update_eff_size(db->fd);
 
+	// update num task
+	conn_server_add_num_task(db->count - last_count);
+
 	// check to commit
 	if (db->count >= queue_size && db->pid == 0)
 	{
-		log_printf("auto commit (DB:%s.%s, COUNT:%d)", conn->user->name, db->name, db->count);
+		log_notice_conn("auto commit (DB:%s.%s, COUNT:%d)", conn->user->name, db->name, db->count);
 		db_import_call(db, conn->user);
 	}
 #if SIZEOF_OFF_T < 8
-	else if ((db->count - db->lcount) > queue_size)
+	else if ((db->count - db->lcount) > queue_size) // check to split
 	{
 		struct stat st;
 
@@ -880,7 +964,7 @@ static int save_conn_request(XS_CONN *conn)
 			}
 			while (access(rcvfile2, R_OK) == 0);
 
-			log_printf("auto split index data (FILE:%s, COUNT:%d)", rcvfile2, db->count);
+			log_notice_conn("auto split data (FILE:%s, COUNT:%d)", rcvfile2, db->count);
 			close(db->fd);
 			db->fd = -1;
 			db->count = db->lcount = 0;
@@ -888,7 +972,7 @@ static int save_conn_request(XS_CONN *conn)
 			// rename the file
 			if (rename(rcvfile, rcvfile2) != 0)
 			{
-				log_printf("failed to rename splitted file (FILE:%s, ERROR:%s)",
+				log_error_conn("failed to rename splitted file (FILE:%s, ERROR:%s)",
 					rcvfile2, strerror(errno));
 			}
 		}
@@ -926,10 +1010,10 @@ static int index_zcmd_exec(XS_CONN *conn)
 	{
 		case CMD_DELETE_PROJECT:
 			// delete current project
-			log_debug_conn("try to delete project (USER:%s, HOME:%s)", conn->user->name, conn->user->home);
+			log_info_conn("try to delete project (USER:%s, HOME:%s)", conn->user->name, conn->user->home);
 			if (rmdir_r(conn->user->home) != 0)
 			{
-				log_conn("unable to remove user home completely (HOME:%s, ERROR:%s)",
+				log_error_conn("failed to remove user home (HOME:%s, ERROR:%s)",
 					conn->user->home, strerror(errno));
 				rc = CONN_RES_ERR(REMOVE_HOME);
 			}
@@ -941,13 +1025,76 @@ static int index_zcmd_exec(XS_CONN *conn)
 				rc = CONN_RES_OK(PROJECT_DEL);
 			}
 			break;
+			// get/set user dict
+		case CMD_INDEX_USER_DICT:
+		{
+			int fd, size = 0;
+			char fpath[256];
+
+			snprintf(fpath, sizeof(fpath) - 1, "%s/" CUSTOM_DICT_FILE, conn->user->home);
+			if (cmd->arg1 == 0) // get dict
+			{
+				char *buf = NULL;
+				if ((fd = open(fpath, O_RDONLY)) >= 0)
+				{
+					struct stat st;
+					if (fstat(fd, &st) != 0)
+					{
+						log_error_conn("failed to get user dict size (ERROR:%s)", strerror(errno));
+					}
+					else
+					{
+						if ((buf = (char *) malloc(st.st_size)) == NULL)
+						{
+							log_error_conn("failed to alloc memory to save dict file");
+						}
+						else
+						{
+							if ((size = read(fd, buf, st.st_size)) <= 0)
+							{
+								if (size < 0)
+								{
+									log_error_conn("failed to read dict file (ERROR:%s)", strerror(errno));
+								}
+								free(buf);
+								buf = NULL;
+							}
+						}
+					}
+					close(fd);
+				}
+				rc = CONN_RES_OK3(INFO, buf, size);
+				if (buf != NULL)
+					free(buf);
+			}
+			else // set dict
+			{
+				if (XS_CMD_BLEN(cmd) == 0)
+				{
+					unlink(fpath);
+					rc = CONN_RES_OK(DICT_SAVED);
+				}
+				else if ((fd = open(fpath, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0)
+				{
+					log_error_conn("failed to open dict file (ERROR:%s)", strerror(errno));
+					rc = CONN_RES_ERR(OPEN_FILE);
+				}
+				else
+				{
+					write(fd, XS_CMD_BUF(cmd), XS_CMD_BLEN(cmd));
+					close(fd);
+					rc = CONN_RES_OK(DICT_SAVED);
+				}
+			}
+		}
+			break;
 			// force to flush logging
 		case CMD_FLUSH_LOGGING:
 			if (import_num >= MAX_IMPORT_NUM)
 				rc = CONN_RES_ERR(BUSY);
 			else
 			{
-				log_conn("force to call xs-logging (USER:%s)", conn->user->name);
+				log_info_conn("force to call xs-logging (USER:%s)", conn->user->name);
 				xs_logging_call(conn->user);
 				rc = CONN_RES_OK(LOG_FLUSHED);
 			}
@@ -958,19 +1105,42 @@ static int index_zcmd_exec(XS_CONN *conn)
 				rc = rebuild_conn_wdb(conn);
 			else
 			{
-				if (!conn->wdb || !(conn->wdb->flag & XS_DBF_REBUILD_BEGIN))
+				XS_DB *db = conn->wdb;
+				if (!db || !(db->flag & XS_DBF_REBUILD_BEGIN))
 					rc = CONN_RES_ERR(WRONGPLACE);
-				else
+				else if (cmd->arg1 == 2) // force to stop rebuild
 				{
-					if (conn->wdb->pid > 0 || conn->wdb->count > 0)
+					if (db->fd >= 0)
 					{
-						conn->wdb->flag |= (XS_DBF_REBUILD_END | XS_DBF_FORCE_COMMIT);
-						log_debug_conn("save the rebuild end flag for next committing (PID:%d,COUNT:%d,FLAG:0x%04x)",
-							conn->wdb->pid, conn->wdb->count, conn->wdb->flag);
+						// clean un-committed data
+						log_debug_conn("clean uncommitted index data for stopping rebuild");
+						clean_uncommitted_data(db, conn->user);
+					}
+					if (db->pid > 0 && !(db->flag & XS_DBF_TOCLEAN) && !kill(db->pid, SIGTERM))
+					{
+						db->flag &= ~XS_DBF_REBUILD_WAIT;
+						db->flag |= XS_DBF_REBUILD_STOP;
+						log_notice_conn("notify running import to quit & set rebuild_stop flag");
 					}
 					else
 					{
-						rebuild_wdb_end(conn->wdb, conn->user);
+						log_info_conn("force to stop rebuilding");
+						db->flag &= ~XS_DBF_REBUILD_MASK;
+						db->flag |= XS_DBF_FORCE_COMMIT;
+					}
+					rc = CONN_RES_OK(DB_REBUILD);
+				}
+				else
+				{
+					if (db->pid > 0 || db->count > 0)
+					{
+						db->flag |= (XS_DBF_REBUILD_END | XS_DBF_FORCE_COMMIT);
+						log_notice_conn("set the rebuild end flag for next commit (PID:%d, COUNT:%d, FLAG:0x%04x)",
+							db->pid, db->count, db->flag);
+					}
+					else
+					{
+						rebuild_wdb_end(db, conn->user);
 					}
 					rc = CONN_RES_OK(DB_REBUILD);
 				}
@@ -987,7 +1157,6 @@ static int index_zcmd_exec(XS_CONN *conn)
 			else
 			{
 				char buf[256];
-
 				snprintf(buf, sizeof(buf) - 1, "{\"name\":\"%s\", \"flag\":%d, \"fd\":%d, \"count\":%d, \"pid\":%d}",
 					conn->wdb->name, conn->wdb->flag, conn->wdb->fd, conn->wdb->count, conn->wdb->pid);
 				rc = CONN_RES_OK2(DB_INFO, buf);
@@ -1030,7 +1199,7 @@ static int index_zcmd_exec(XS_CONN *conn)
 				rc = CONN_RES_ERR(BUSY);
 			else
 			{
-				log_conn("force to commit database (DB:%s.%s)", conn->user->name, conn->wdb->name);
+				log_info_conn("force to commit (DB:%s.%s)", conn->user->name, conn->wdb->name);
 				db_import_call(conn->wdb, conn->user);
 				rc = CONN_RES_OK(DB_COMMITED);
 			}
@@ -1054,6 +1223,21 @@ static int index_zcmd_exec(XS_CONN *conn)
 		case CMD_DOC_VALUE:
 		case CMD_DOC_INDEX:
 			rc = CMD_RES_CONT | CMD_RES_SAVE;
+			break;
+			// scws multi
+		case CMD_SEARCH_SCWS_SET:
+			if (cmd->arg1 == CMD_SCWS_SET_MULTI && get_conn_wdb(conn) != NULL)
+				conn->wdb->scws_multi = (short) cmd->arg2;
+			break;
+		case CMD_SEARCH_SCWS_GET:
+			if (cmd->arg1 != CMD_SCWS_GET_MULTI || get_conn_wdb(conn) == NULL)
+				rc = CMD_RES_UNIMP;
+			else
+			{
+				char buf[8];
+				sprintf(buf, "%d", conn->wdb->scws_multi);
+				rc = CONN_RES_OK2(INFO, buf);
+			}
 			break;
 			// others, passed to next handler
 		default:
@@ -1081,14 +1265,14 @@ static void index_server_timeout()
 int main(int argc, char *argv[])
 {
 	char prog_path[PATH_MAX], *ctrl = NULL;
-	const char *bind, *home, *bpath;
+	const char *bind, *home, *epath;
 	int cc;
 
 	// init the global value
 	home = PREFIX;
 	bind = DEFAULT_BIND_PATH;
 	queue_size = DEFAULT_QUEUE_SIZE;
-	bpath = DEFAULT_BIN_PATH;
+	epath = DEFAULT_BIN_PATH;
 
 	time(&time_logging);
 	time_logging -= 3600;
@@ -1096,15 +1280,13 @@ int main(int argc, char *argv[])
 #ifndef HAVE_SETPROCTITLE
 	save_main_args(argc, argv);
 #endif
-
 	// get prog_name & prog_path
 	realpath(argv[0], prog_path);
 	if ((prog_name = strrchr(argv[0], '/')) != NULL) prog_name++;
 	else prog_name = argv[0];
 
-	log_debug("parse arguments");
 	// parse arguments, NOTE: optarg maybe changed by setproctitle()
-	while ((cc = getopt(argc, argv, "FvhH:b:k:l:q:e:?")) != -1)
+	while ((cc = getopt(argc, argv, "FvhL:H:b:k:l:q:e:?")) != -1)
 	{
 		switch (cc)
 		{
@@ -1112,12 +1294,14 @@ int main(int argc, char *argv[])
 				break;
 			case 'H': home = optarg;
 				break;
+			case 'L': log_level(atoi(optarg));
+				break;
 			case 'b': bind = optarg;
 				break;
 			case 'k': ctrl = optarg;
 				break;
 			case 'l':
-				if (log_open(optarg, NULL) < 0)
+				if (log_open(optarg, NULL, -1) < 0)
 					fprintf(stderr, "WARNING: failed to open log file (FILE:%s)\n", optarg);
 				break;
 			case 'q':
@@ -1125,7 +1309,7 @@ int main(int argc, char *argv[])
 				if (queue_size < 1)
 					queue_size = DEFAULT_QUEUE_SIZE;
 				break;
-			case 'e': bpath = optarg;
+			case 'e': epath = optarg;
 				break;
 			case 'v':
 				show_version();
@@ -1147,44 +1331,44 @@ int main(int argc, char *argv[])
 			home, strerror(errno));
 		goto main_end;
 	}
-	// Check the temporary directory: tmp/ (writable required)
+	// check the temporary directory: tmp/ (writable required)
 	if (access(DEFAULT_TEMP_DIR, W_OK) < 0)
 	{
 		fprintf(stderr, "ERROR: temp directory not exists or not writable (DIR:" DEFAULT_TEMP_DIR ")\n");
 		goto main_end;
 	}
 	// check the import/logging binary executable file
-	snprintf(xs_import, sizeof(xs_import), "%s/xs-import", bpath);
-	snprintf(xs_logging, sizeof(xs_logging), "%s/xs-logging", bpath);
+	snprintf(xs_import, sizeof(xs_import), "%s/xs-import", epath);
+	snprintf(xs_logging, sizeof(xs_logging), "%s/xs-logging", epath);
 	if (access(xs_import, X_OK) < 0)
 	{
-		fprintf(stderr, "ERROR: xs-import program check failed (FILE:%s, ERROR:%s)\n",
+		fprintf(stderr, "ERROR: `xs-import' checking failure (FILE:%s, ERROR:%s)\n",
 			xs_import, strerror(errno));
 		goto main_end;
 	}
 	if (access(xs_logging, X_OK) < 0)
 	{
-		fprintf(stderr, "ERROR: xs-logging program check failed (FILE:%s, ERROR:%s)\n",
+		fprintf(stderr, "ERROR: `xs-logging' program checking failure (FILE:%s, ERROR:%s)\n",
 			xs_logging, strerror(errno));
 		goto main_end;
 	}
 
-	// Just run the control signal `-k'
+	// just run the control signal `-k'
 	if (ctrl != NULL)
 		pcntl_kill(bind, ctrl, prog_name);
 
 	// basic setup: mask, signal, log_id
 	umask(022);
-	log_setid("indexd");
+	log_ident("indexd");
 
 	// become daemon or not?
-	log_debug("start the server (FLAG: 0x%04x)", main_flag);
+	log_debug("main start (FLAG: 0x%04x)", main_flag);
 	if (!(main_flag & FLAG_FOREGROUND))
 		pcntl_daemon();
 	else
 	{
-		log_open("stderr", NULL);
-		fprintf(stderr, "WARNING: run on foreground, log messages are redirected to <stderr>\n");
+		log_open("stderr", NULL, -1);
+		fprintf(stderr, "WARNING: run on foreground, logs are redirected to <stderr>\n");
 	}
 
 	// check running & save the pid
@@ -1192,13 +1376,18 @@ int main(int argc, char *argv[])
 	if ((cc = pcntl_running(bind, 1)) != 0)
 	{
 		if (cc > 0)
-			log_printf("ERROR: the server is running (BIND_ON:%s)", bind);
+		{
+			log_error("server is running (BIND:%s, PID:%d)", bind, cc);
+		}
 		else
-			log_printf("ERROR: unable to save the pid (ERROR:%s)", strerror(errno));
+		{
+			log_error("failed to save the pid (ERROR:%s)", strerror(errno));
+		}
 		goto main_end;
 	}
 
 	// install signal handlers
+	log_debug("install base signal handler");
 	pcntl_base_signal();
 
 	// init global variables
@@ -1211,7 +1400,7 @@ int main(int argc, char *argv[])
 	// create socket server (NOTE: should before setproctitle)
 	if ((cc = conn_server_listen(bind)) < 0)
 	{
-		log_printf("socket server listen/bind failed");
+		log_error("socket server listen/bind failure");
 		goto main_end;
 	}
 
@@ -1219,6 +1408,7 @@ int main(int argc, char *argv[])
 	setproctitle("server");
 
 	// start the listen server
+	log_alert("server start (BIND:%s)", bind);
 	conn_server_init();
 	conn_server_set_zcmd_handler(index_zcmd_exec);
 	conn_server_set_timeout_handler(index_server_timeout);
@@ -1226,6 +1416,7 @@ int main(int argc, char *argv[])
 
 	// finished gracefully
 	main_flag |= FLAG_NO_ERROR;
+
 	// end the main
 main_end:
 	log_debug("main end");

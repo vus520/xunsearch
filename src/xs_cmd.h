@@ -168,6 +168,13 @@ struct xs_import_hdr
 #define	CMD_INDEX_SYNONYMS	42
 
 /**
+ * Get/Set custom dict for a project
+ * arg1:flag(get/set)
+ * blen:dict_txt_len, buf:dict_txt_content
+ */
+#define	CMD_INDEX_USER_DICT	43
+
+/**
  * ----------------------------------------
  * Commands of search server: 64~95
  * All commands can get respond from server
@@ -403,6 +410,12 @@ struct xs_import_hdr
 #define	CMD_SEARCH_SCWS_SET		198
 
 /**
+ * Set the percentage and/or weight cutoffs
+ * arg1:percent_off(0-100), arg2:weight_off(0.1-25.5)
+ */
+#define	CMD_SEARCH_SET_CUTOFF	199
+
+/**
  * ----------------------------------
  * Commands for search query: 224~255
  * ----------------------------------
@@ -534,6 +547,7 @@ struct xs_import_hdr
 #define	CMD_SCWS_GET_RESULT		2
 #define	CMD_SCWS_GET_TOPS		3
 #define	CMD_SCWS_HAS_WORD		4
+#define	CMD_SCWS_GET_MULTI		5
 
 #define	CMD_SCWS_SET_IGNORE		50
 #define	CMD_SCWS_SET_MULTI		51
@@ -580,7 +594,7 @@ struct xs_import_hdr
 #define	CMD_ERR_XAPIAN			515
 
 // err string
-#define	CMD_ERR_600				"Unknown Internal Error"
+#define	CMD_ERR_600				"Unknown internal error"
 #define	CMD_ERR_401				"Project name not specified"
 #define	CMD_ERR_402				"Data/Name too long"
 #define	CMD_ERR_403				"Data/Name contains invalid characters"
@@ -634,6 +648,7 @@ struct xs_import_hdr
 #define	CMD_OK_DB_COMMITED		256
 #define	CMD_OK_DB_REBUILD		257
 #define	CMD_OK_LOG_FLUSHED		258
+#define	CMD_OK_DICT_SAVED		259
 
 // for searchd
 // Each record per line, split by '\t'

@@ -87,6 +87,23 @@ class XSSearch extends XSServer
 	}
 
 	/**
+	 * 设置百分比/权重剔除参数
+	 * 通常是在开启 {setFuzzy} 或使用 OR 连接搜索语句时才需要设置此项
+	 * @param int $percent 剔除匹配百分比低于此值的文档, 值范围 0-100
+	 * @param float $weight 剔除权重低于此值的文档, 值范围 0.1-25.5, 0 表示不剔除
+	 * @return XSSearch 返回对象本身以支持串接操作
+	 * @see setFuzzy
+	 */
+	public function setCutOff($percent, $weight = 0)
+	{
+		$percent = max(0, min(100, intval($percent)));
+		$weight = max(0, (intval($weight * 10) & 255));
+		$cmd = new XSCommand(CMD_SEARCH_SET_CUTOFF, $percent, $weight);
+		$this->execCommand($cmd);
+		return $this;
+	}
+
+	/**
 	 * 开启自动同义词搜索功能
 	 * @param bool $value 设为 true 表示开启同义词功能, 设为 false 关闭同义词功能
 	 * @return XSSearch 返回对象本身以支持串接操作
@@ -139,6 +156,16 @@ class XSSearch extends XSServer
 		$query = $query === null ? '' : $this->preQueryString($query);
 		$cmd = new XSCommand(CMD_QUERY_GET_STRING, 0, $this->_defaultOp, $query);
 		$res = $this->execCommand($cmd, CMD_OK_QUERY_STRING);
+		if (strpos($res->buf, 'VALUE_RANGE') !== false)
+		{
+			$regex = '/(VALUE_RANGE) (\d+) (\S+) (\S+?)(?=\))/';
+			$res->buf = preg_replace_callback($regex, array($this, 'formatValueRange'), $res->buf);
+		}
+		if (strpos($res->buf, 'VALUE_GE') !== false || strpos($res->buf, 'VALUE_LE') !== false)
+		{
+			$regex = '/(VALUE_[GL]E) (\d+) (\S+?)(?=\))/';
+			$res->buf = preg_replace_callback($regex, array($this, 'formatValueRange'), $res->buf);
+		}
 		return XS::convert($res->buf, $this->_charset, 'UTF-8');
 	}
 
@@ -248,6 +275,10 @@ class XSSearch extends XSServer
 	 */
 	public function addRange($field, $from, $to)
 	{
+		if ($from === '' || $from === false)
+			$from = null;
+		if ($to === '' || $to === false)
+			$to = null;
 		if ($from !== null || $to !== null)
 		{
 			if (strlen($from) > 255 || strlen($to) > 255)
@@ -321,6 +352,26 @@ class XSSearch extends XSServer
 		if ($field === null)
 			return $this->_facets;
 		return isset($this->_facets[$field]) ? $this->_facets[$field] : array();
+	}
+
+	/**
+	 * 设置当前搜索语句的分词复合等级
+	 * 复合等级是 scws 分词粒度控制的一个重要参数, 是长词细分处理依据, 默认为 3, 值范围 0~15
+	 * 注意: 这个设置仅直对本次搜索有效, 仅对设置之后的 {@link setQuery} 起作用, 由于 query
+	 * 设计的方式问题, 目前无法支持搜索语句单字切分, 但您可以在模糊检索时设为 0 来关闭复合分词
+	 * @param int $level 要设置的分词复合等级
+	 * @return XSSearch 返回自身对象以支持串接操作
+	 * @since 1.4.7
+	 */
+	public function setScwsMulti($level)
+	{
+		$level = intval($level);
+		if ($level >= 0 && $level < 16)
+		{
+			$cmd = array('cmd' => CMD_SEARCH_SCWS_SET, 'arg1' => CMD_SCWS_SET_MULTI, 'arg2' => $level);
+			$this->execCommand($cmd);
+		}
+		return $this;
 	}
 
 	/**
@@ -444,6 +495,9 @@ class XSSearch extends XSServer
 			$this->_highlight = $query;
 		$query = $query === null ? '' : $this->preQueryString($query);
 		$page = pack('II', $this->_offset, $this->_limit > 0 ? $this->_limit : self::PAGE_SIZE);
+
+		// init special field hrere
+		$this->initSpecialField();
 
 		// get result header
 		$cmd = new XSCommand(CMD_SEARCH_GET_RESULT, 0, $this->_defaultOp, $query, $page);
@@ -752,6 +806,8 @@ class XSSearch extends XSServer
 	 */
 	private function logQuery($query = null)
 	{
+		if ($this->isRobotAgent())
+			return;
 		if ($query !== '' && $query !== null)
 			$terms = $this->terms($query, false);
 		else
@@ -822,7 +878,7 @@ class XSSearch extends XSServer
 	 * @param float $scale 权重计算缩放比例, 默认为 1表示不缩放, 其它值范围 0.xx ~ 655.35
 	 * @return string 修正后的搜索语句
 	 */
-	private function addQueryString($query, $addOp = CMD_QUERY_OP_AND, $scale = 1)
+	public function addQueryString($query, $addOp = CMD_QUERY_OP_AND, $scale = 1)
 	{
 		$query = $this->preQueryString($query);
 		$bscale = ($scale > 0 && $scale != 1) ? pack('n', intval($scale * 100)) : '';
@@ -904,29 +960,30 @@ class XSSearch extends XSServer
 					&& $field->vno != XSFieldScheme::MIXED_VNO)
 				{
 					$this->regQueryPrefix($name);
-					if (!$field->isBoolIndex() && substr($part, $pos + 1, 1) != '('
-						&& preg_match('/[\x81-\xfe]/', $part))
+					if ($field->hasCustomTokenizer())
 					{
-						$newQuery .= substr($part, 0, $pos + 1) . '(' . substr($part, $pos + 1) . ')';
-					}
-					else if ($field->isBoolIndex())
-					{
+						$prefix = $i > 0 ? substr($part, 0, $i) : '';
+						$suffix = '';
 						// force to lowercase for boolean terms
 						$value = substr($part, $pos + 1);
-						// Add custom tokenizer supported
-						if (!$field->hasCustomTokenizer())
-							$newQuery .= substr($part, 0, $pos + 1) . strtolower($value);
-						else
+						if (substr($value, -1, 1) === ')')
 						{
-							$terms = array();
-							$tokens = $field->getCustomTokenizer()->getTokens($value);
-							foreach ($tokens as $term)
-							{
-								$terms[] = strtolower($term);
-							}
-							$terms = array_unique($terms);
-							$newQuery .= $name . ':' . implode(' ' . $name . ':', $terms);
+							$suffix = ')';
+							$value = substr($value, 0, -1);
 						}
+						$terms = array();
+						$tokens = $field->getCustomTokenizer()->getTokens($value);
+						foreach ($tokens as $term)
+						{
+							$terms[] = strtolower($term);
+						}
+						$terms = array_unique($terms);
+						$newQuery .= $prefix . $name . ':' . implode(' ' . $name . ':', $terms) . $suffix;
+					}
+					else if (substr($part, $pos + 1, 1) != '(' && preg_match('/[\x81-\xfe]/', $part))
+					{
+						// force to add brackets for default scws tokenizer
+						$newQuery .= substr($part, 0, $pos + 1) . '(' . substr($part, $pos + 1) . ')';
 					}
 					else
 					{
@@ -942,26 +999,6 @@ class XSSearch extends XSServer
 				continue;
 			}
 			$newQuery .= $part;
-		}
-
-		// check to send cutlen/numeric once
-		if ($this->_fieldSet !== true)
-		{
-			foreach ($this->xs->getAllFields() as $field) /* @var $field XSFieldMeta */
-			{
-				if ($field->cutlen != 0)
-				{
-					$len = min(127, ceil($field->cutlen / 10));
-					$cmd = new XSCommand(CMD_SEARCH_SET_CUT, $len, $field->vno);
-					$this->execCommand($cmd);
-				}
-				if ($field->isNumeric())
-				{
-					$cmd = new XSCommand(CMD_SEARCH_SET_NUMERIC, 0, $field->vno);
-					$this->execCommand($cmd);
-				}
-			}
-			$this->_fieldSet = true;
 		}
 		return XS::convert($newQuery, 'UTF-8', $this->_charset);
 	}
@@ -981,6 +1018,30 @@ class XSSearch extends XSServer
 			$this->execCommand($cmd);
 			$this->_prefix[$name] = true;
 		}
+	}
+
+	/**
+	 * 设置字符型字段及裁剪长度
+	 */
+	private function initSpecialField()
+	{
+		if ($this->_fieldSet === true)
+			return;
+		foreach ($this->xs->getAllFields() as $field) /* @var $field XSFieldMeta */
+		{
+			if ($field->cutlen != 0)
+			{
+				$len = min(127, ceil($field->cutlen / 10));
+				$cmd = new XSCommand(CMD_SEARCH_SET_CUT, $len, $field->vno);
+				$this->execCommand($cmd);
+			}
+			if ($field->isNumeric())
+			{
+				$cmd = new XSCommand(CMD_SEARCH_SET_NUMERIC, 0, $field->vno);
+				$this->execCommand($cmd);
+			}
+		}
+		$this->_fieldSet = true;
 	}
 
 	/**
@@ -1074,5 +1135,117 @@ class XSSearch extends XSServer
 			$this->_highlight['pattern'] = $pattern;
 			$this->_highlight['replace'] = $replace;
 		}
+	}
+
+	/**
+	 * Format the value range/ge
+	 * @param array $match
+	 * @return string
+	 */
+	private function formatValueRange($match)
+	{
+		// VALUE_[GL]E 0 xxx yyy
+		$field = $this->xs->getField(intval($match[2]), false);
+		if ($field === false)
+			return $match[0];
+		$val1 = $val2 = '~';
+		if (isset($match[4]))
+			$val2 = $field->isNumeric() ? $this->xapianUnserialise($match[4]) : $match[4];
+		if ($match[1] === 'VALUE_LE')
+			$val2 = $field->isNumeric() ? $this->xapianUnserialise($match[3]) : $match[3];
+		else
+			$val1 = $field->isNumeric() ? $this->xapianUnserialise($match[3]) : $match[3];
+		return $field->name . ':[' . $val1 . ',' . $val2 . ']';
+	}
+
+	/**
+	 * Convert a string encoded by xapian to a floating point number
+	 * @param string $value
+	 * @return double unserialised number
+	 */
+	private function xapianUnserialise($value)
+	{
+		if ($value === "\x80")
+			return 0.0;
+		if ($value === str_repeat("\xff", 9))
+			return INF;
+		if ($value === '')
+			return -INF;
+		$i = 0;
+		$c = ord($value[0]);
+		$c ^= ($c & 0xc0) >> 1;
+		$negative = !($c & 0x80) ? 1 : 0;
+		$exponent_negative = ($c & 0x40) ? 1 : 0;
+		$explen = !($c & 0x20) ? 1 : 0;
+		$exponent = $c & 0x1f;
+		if (!$explen)
+		{
+			$exponent >>= 2;
+			if ($negative ^ $exponent_negative)
+				$exponent ^= 0x07;
+		}
+		else
+		{
+			$c = ord($value[++$i]);
+			$exponent <<= 6;
+			$exponent |= ($c >> 2);
+			if ($negative ^ $exponent_negative)
+				$exponent &= 0x07ff;
+		}
+
+		$word1 = ($c & 0x03) << 24;
+		$word1 |= ord($value[++$i]) << 16;
+		$word1 |= ord($value[++$i]) << 8;
+		$word1 |= ord($value[++$i]);
+
+		$word2 = 0;
+		if ($i < strlen($value))
+		{
+			$word2 = ord($value[++$i]) << 24;
+			$word2 |= ord($value[++$i]) << 16;
+			$word2 |= ord($value[++$i]) << 8;
+			$word2 |= ord($value[++$i]);
+		}
+
+		if (!$negative)
+			$word1 |= 1 << 26;
+		else
+		{
+			$word1 = 0 - $word1;
+			if ($word2 != 0)
+				++$word1;
+			$word1 &= 0x03ffffff;
+		}
+
+		$mantissa = 0;
+		if ($word2)
+			$mantissa = $word2 / 4294967296.0; // 1<<32
+		$mantissa += $word1;
+		$mantissa /= 1 << ($negative === 1 ? 26 : 27);
+		if ($exponent_negative)
+			$exponent = 0 - $exponent;
+		$exponent += 8;
+		if ($negative)
+			$mantissa = 0 - $mantissa;
+
+		return round($mantissa * pow(2, $exponent), 2);
+	}
+
+	/**
+	 * @return boolean whether the user agent is a robot or search engine
+	 */
+	private function isRobotAgent()
+	{
+		if (isset($_SERVER['HTTP_USER_AGENT']))
+		{
+			$agent = strtolower($_SERVER['HTTP_USER_AGENT']);
+			$keys = array('bot', 'slurp', 'spider', 'crawl', 'curl');
+			foreach ($keys as $key)
+			{
+				if (strpos($agent, $key) !== false)
+					return true;
+			}
+		}
+		return false;
 	}
 }
