@@ -65,7 +65,7 @@ class XSIndex extends XSServer
 		$fid = $this->xs->getFieldId();
 		$key = $doc->f($fid);
 		if ($key === null || $key === '')
-			throw new XSException('Missing value of primarky key (FIELD:' . $fid . ')');
+			throw new XSException('Missing value of primary key (FIELD:' . $fid . ')');
 
 		// request cmd		
 		$cmd = new XSCommand(CMD_INDEX_REQUEST, CMD_INDEX_REQUEST_ADD);
@@ -111,6 +111,8 @@ class XSIndex extends XSServer
 						{
 							foreach ($terms as $term)
 							{
+								if (strlen($term) > 200)
+									continue;
 								$term = strtolower($term);
 								$cmds[] = new XSCommand(CMD_DOC_TERM, 1, $field->vno, $term);
 							}
@@ -134,6 +136,8 @@ class XSIndex extends XSServer
 				foreach ($terms as $term => $wdf)
 				{
 					$term = strtolower($term);
+					if (strlen($term) > 200)
+						continue;
 					$wdf2 = $field->isBoolIndex() ? 1 : $wdf * $field->weight;
 					while ($wdf2 > XSFieldMeta::MAX_WDF)
 					{
@@ -158,6 +162,8 @@ class XSIndex extends XSServer
 					$terms = $field->getCustomTokenizer()->getTokens($text, $doc);
 					foreach ($terms as $term)
 					{
+						if (strlen($term) > 200)
+							continue;
 						$term = strtolower($term);
 						$cmds[] = new XSCommand(CMD_DOC_TERM, $wdf, $field->vno, $term);
 					}
@@ -298,6 +304,40 @@ class XSIndex extends XSServer
 	}
 
 	/**
+	 * 设置当前索引库的分词复合等级
+	 * 复合等级是 scws 分词粒度控制的一个重要参数, 是长词细分处理依据, 默认为 3, 值范围 0~15
+	 * 注意: 这个设置仅直对当前索引库有效, 多次调用设置值被覆盖仅最后那次设置有效,
+	 * 而且仅对设置之后提交的索引数据起作用, 如需对以前的索引数据生效请重建索引.
+	 * @param int $level 要设置的分词复合等级
+	 * @return XSIndex 返回自身对象以支持串接操作
+	 * @since 1.4.7
+	 * @throw XSException 出错时抛出异常
+	 */
+	public function setScwsMulti($level)
+	{
+		$level = intval($level);
+		if ($level >= 0 && $level < 16)
+		{
+			$cmd = array('cmd' => CMD_SEARCH_SCWS_SET, 'arg1' => CMD_SCWS_SET_MULTI, 'arg2' => $level);
+			$this->execCommand($cmd);
+		}
+		return $this;
+	}
+
+	/**
+	 * 获取当前索引库的分词复合等级
+	 * @return int 返回当前库的分词复合等级
+	 * @see setScwsMulti
+	 * @since 1.4.7
+	 */
+	public function getScwsMulti()
+	{
+		$cmd = array('cmd' => CMD_SEARCH_SCWS_GET, 'arg1' => CMD_SCWS_GET_MULTI);
+		$res = $this->execCommand($cmd, CMD_OK_INFO);
+		return intval($res->buf);
+	}
+
+	/**
 	 * 开启索引命令提交缓冲区
 	 * 为优化网络性能, 有必要先将本地提交的 add/update/del 等索引变动指令缓存下来, 
 	 * 当总大小达到参数指定的 size 时或调用 {@link closeBuffer} 时再真正提交到服务器
@@ -331,7 +371,7 @@ class XSIndex extends XSServer
 	 * {@link endRebuild} 实现平滑重建索引, 重建过程仍可搜索旧的索引库,
 	 * 如直接用 {@link clean} 清空数据, 则会导致重建过程搜索到不全的数据
 	 * @return XSIndex 返回自身对象以支持串接操作
-	 * @see endRebuild	
+	 * @see endRebuild
 	 */
 	public function beginRebuild()
 	{
@@ -352,6 +392,28 @@ class XSIndex extends XSServer
 		{
 			$this->_rebuild = false;
 			$this->execCommand(array('cmd' => CMD_INDEX_REBUILD, 'arg1' => 1), CMD_OK_DB_REBUILD);
+		}
+		return $this;
+	}
+
+	/**
+	 * 中止索引重建
+	 * 丢弃重建临时库的所有数据, 恢复成当前搜索库, 主要用于偶尔重建意外中止的情况
+	 * @return XSIndex 返回自身对象以支持串接操作
+	 * @see beginRebuild
+	 * @since 1.3.4
+	 */
+	public function stopRebuild()
+	{
+		try
+		{
+			$this->execCommand(array('cmd' => CMD_INDEX_REBUILD, 'arg1' => 2), CMD_OK_DB_REBUILD);
+			$this->_rebuild = false;
+		}
+		catch (XSException $e)
+		{
+			if ($e->getCode() !== CMD_ERR_WRONGPLACE)
+				throw $e;
 		}
 		return $this;
 	}
@@ -404,6 +466,28 @@ class XSIndex extends XSServer
 			throw $e;
 		}
 		return true;
+	}
+
+	/**
+	 * 获取自定义词典内容
+	 * @return string 自定义词库内容
+	 * @throw XSException 出错时抛出异常
+	 */
+	public function getCustomDict()
+	{
+		$res = $this->execCommand(CMD_INDEX_USER_DICT, CMD_OK_INFO);
+		return $res->buf;
+	}
+
+	/**
+	 * 设置自定义词典内容
+	 * @param string $content 新的词典内容
+	 * @throw XSException 出错时抛出异常
+	 */
+	public function setCustomDict($content)
+	{
+		$cmd = array('cmd' => CMD_INDEX_USER_DICT, 'arg1' => 1, 'buf' => $content);
+		$this->execCommand($cmd, CMD_OK_DICT_SAVED);
 	}
 
 	/**

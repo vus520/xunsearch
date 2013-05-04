@@ -5,13 +5,13 @@
 #
 
 AC_PREREQ([2.68])
-AC_INIT([xunsearch], [1.3.4-dev], [http://www.xunsearch.com/bugs])
+AC_INIT([xunsearch], [1.4.7-dev], [http://www.xunsearch.com/bugs])
 
 # for automake
 AM_INIT_AUTOMAKE
 
 # Copy wright
-AC_COPYRIGHT([Copyright (C)2007-2011, hightman
+AC_COPYRIGHT([Copyright (C)2007-2013, hightman
 This package maybe copied, distributed and modified under
 the terms of my License; see COPYING for more detials.])
 
@@ -65,6 +65,8 @@ if test "$enable_debug" = "yes"; then
 	tmp_cxxflags=`echo $CXXFLAGS | sed 's/-g//g'`
 	if test "$tmp_cflags" = "$CFLAGS" ; then CFLAGS="$CFLAGS -g"; fi
 	if test "$tmp_cxxflags" = "$CXXFLAGS" ; then CXXFLAGS="$CXXFLAGS -g"; fi
+	CFLAGS=`echo $CFLAGS | sed 's/-O@<:@0-9@:>@/-O0/g'`
+	CXXFLAGS=`echo $CXXFLAGS | sed 's/-O@<:@0-9@:>@/-O0/g'`
 	AC_DEFINE(DEBUG, 1, [Define to 1 if you want to enable debug flags])
 else
 	tmp_cflags=`echo $CFLAGS | sed 's/-O//g'`
@@ -102,7 +104,7 @@ if test "$with_libevent" != "no" ; then
 	LIBEVENT_DIR=""
 	if test "$with_libevent" = "yes" ; then
         search_dirs=`echo $ac_search_dirs | sed 's#<name>#libevent#g'`
-		for tmpdir in $ac_search_dirs; do
+		for tmpdir in $search_dirs; do
 			if test -f $tmpdir/include/event.h ; then
 				LIBEVENT_DIR=$tmpdir
 				break;
@@ -163,7 +165,7 @@ if test "$with_scws" != "no" ; then
 	SCWS_DIR=""
 	if test "$with_scws" = "yes" ; then
         search_dirs=`echo $ac_search_dirs | sed 's#<name>#scws#g'`
-		for tmpdir in $ac_search_dirs; do
+		for tmpdir in $search_dirs; do
 			if test -f $tmpdir/include/scws/scws.h ; then
 				SCWS_DIR=$tmpdir
 				break;
@@ -205,7 +207,7 @@ if test "$with_scws" != "no" ; then
 		]
 	) 	
 else
-	AC_MSG_ERROR([scws is required, get it from: http://www.ftphp.com/scws/])
+	AC_MSG_ERROR([scws is required, get it from: http://www.xunsearch.com/scws/])
 fi
 
 # Xapian-core package check
@@ -219,7 +221,7 @@ if test "$with_xapian" != "no" ; then
 	XAPIAN_DIR=""
 	if test "$with_xapian" = "yes" ; then
         search_dirs=`echo $ac_search_dirs | sed 's#<name>#xapian#g'`       
-		for tmpdir in $ac_search_dirs; do
+		for tmpdir in $search_dirs; do
 			if test -f $tmpdir/include/xapian.h ; then
 				XAPIAN_DIR=$tmpdir
 				break;
@@ -262,7 +264,7 @@ yes
 			], [
 Xapian::Document doc;
 Xapian::TermGenerator indexer;
-indexer.load_libscws(NULL, 0, 0);
+indexer.load_scws(NULL, 0, 0);
 indexer.set_document(doc);
 			])
 		], [ 

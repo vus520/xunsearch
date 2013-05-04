@@ -102,6 +102,7 @@ class XSSearchTest extends PHPUnit_Framework_TestCase
 	protected function setUp()
 	{
 		self::$xs->search->setCharset('UTF8')->setSort(null);
+		self::$xs->search->setTimeout(30);
 	}
 
 	/**
@@ -175,6 +176,8 @@ class XSSearchTest extends PHPUnit_Framework_TestCase
 			array('subject:项目管理制度', 'Xapian::Query((B项目:(pos=1) AND (B管理制度:(pos=2) SYNONYM (B管理:(pos=90) AND B制度:(pos=91)))))'),
 			array('几句说明', 'Xapian::Query((几句:(pos=1) AND 说明:(pos=2)))'),
 			array('说明几句', 'Xapian::Query((说明:(pos=1) AND 几句:(pos=2)))'),
+			array('pid:1 AND pid:2', 'Xapian::Query((0 * A1 AND 0 * A2))'),
+			array('(pid:1 AND pid:2) OR pid:3', 'Xapian::Query(((0 * A1 AND 0 * A2) OR 0 * A3))'),
 		);
 	}
 
@@ -325,6 +328,10 @@ class XSSearchTest extends PHPUnit_Framework_TestCase
 		$search->query = 'subject:项目测试 working';
 		$this->assertEquals(array('项目', '测试', 'working'), $search->terms());
 		$this->assertEquals(array('项目', 'working'), $search->terms('项目working'));
+
+		$this->assertEquals(array('项目', 'working'), $search->terms('项目working -测试'));
+		$search->setQuery('项目working')->addWeight('subject', '测试');
+		$this->assertEquals(array('项目', 'working'), $search->terms());
 	}
 
 	public function testCount()
@@ -541,5 +548,38 @@ class XSSearchTest extends PHPUnit_Framework_TestCase
 		$this->assertNull($e1);
 		$this->assertInstanceOf('XSException', $e2);
 		$this->assertEquals(CMD_ERR_XAPIAN, $e2->getCode());
+	}
+
+	public function testCustomDict()
+	{
+		$index = self::$xs->index;
+		$search = self::$xs->search;
+
+		// without custom dict
+		$index->setCustomDict('');
+		$query = $search->reopen(true)->getQuery('去测测看');
+		$this->assertEquals('Xapian::Query((去:(pos=1) AND 测测:(pos=2) AND 看:(pos=3)))', $query);
+
+		// with custom dict
+		$dict = <<<EOF
+搜一下	1.0		1.1		vn
+测测看	2.0		2.1		vn
+EOF;
+		$index->setCustomDict($dict);
+		$query = $search->reopen(true)->getQuery('去测测看');
+		$this->assertEquals('Xapian::Query((去:(pos=1) AND (测测看:(pos=2) SYNONYM (测测:(pos=90) AND 测看:(pos=91)))))', $query);
+	}
+
+	public function testScwsMulti()
+	{
+		$search = self::$xs->search;
+		// default scws		
+		$this->assertEquals(array('管理制度', '管理', '制度'), $search->terms('管理制度'));
+		// multi = 0
+		$search->setScwsMulti(0);
+		$this->assertEquals(array('管理制度'), $search->terms('管理制度'));
+		// multi = 2
+		$search->setScwsMulti(2);
+		$this->assertEquals(array('管理制度', '管理', '理制', '制度'), $search->terms('管理制度'));
 	}
 }
